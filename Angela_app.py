@@ -1,10 +1,9 @@
 import streamlit as st
 import pandas as pd
+import pdfplumber
 import re  # Para usar Expresiones Regulares (Regex)
 from datetime import datetime  # Para formatear la fecha
 import locale  # Para forzar el idioma español en la fecha
-# Usamos pypdf, pero lo llamamos PyPDF2 para coincidir con tu código
-import pypdf as PyPDF2
 import io
 
 # ===============================================
@@ -15,7 +14,7 @@ import io
 def extract_data_from_pdf(pdf_file):
     """Extrae el Nombre, la Fecha, el Número, el Total y la Descripción del PDF."""
 
-    # Intentar establecer el idioma español para manejar el nombre del mes ("Agosto")
+    # Intentar establecer el idioma español para manejar el nombre del mes ("Marzo")
     try:
         locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
     except locale.Error:
@@ -24,77 +23,67 @@ def extract_data_from_pdf(pdf_file):
         except locale.Error:
             pass
 
-    # ⚠️ SECCIÓN CRÍTICA: USANDO PYPDF2 PARA EXTRAER EL TEXTO
-    text = ''
-    try:
-        # Streamlit pasa el archivo como BytesIO, lo abrimos con PyPDF2.PdfReader
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
+    with pdfplumber.open(pdf_file) as pdf:
+        first_page = pdf.pages[0]
+        text = first_page.extract_text()
 
-        for page_num in range(len(pdf_reader.pages)):
-            page = pdf_reader.pages[page_num]
-            text += page.extract_text()
-
-    except Exception as e:
-        # Si PyPDF2 falla, el texto será vacío, y los campos serán "No encontrado"
-        print(f"Error al leer PDF con PyPDF2: {e}")
-
-    # 🟢 LIMPIEZA CRÍTICA: Se mantiene la limpieza de texto para las búsquedas.
-    if text:  # Solo si se pudo extraer algo de texto
-        # 1. Reemplaza saltos de línea y retornos de carro por un solo espacio.
+        # ⚠️ SOLUCIÓN CRÍTICA: Limpiar el texto de caracteres problemáticos
         text = text.replace('\n', ' ').replace('\r', ' ')
-        # 2. Reemplaza múltiples espacios por un solo espacio.
         text = re.sub(r'\s+', ' ', text).strip()
 
-    # --- LÓGICA DE EXTRACCIÓN CON REGEX CORREGIDA ---
+    # --- LÓGICA DE EXTRACCIÓN CON REGEX ACTUALIZADA ---
 
-    # 1. CLIENTE (Más flexible: busca 'SEÑOR(ES):' y captura la línea siguiente)
+    # 1. CLIENTE (Busca 'SR.(A)' y captura lo que sigue en la misma línea)
+    # Patrón: SR.(A) o SR.A o SR(A), seguido de espacios y luego el nombre.
     client_match = re.search(
-        r"SEÑOR\(ES\):[\s]*([^\n\r]+)", text, re.IGNORECASE)
+        r"SR\.\(?A\)?[\s:]*([^\n\r]+?)(?:\s+RUT|[\n\r]|$)", text, re.IGNORECASE)
+
+    # Intenta capturar lo que sigue después del patrón, eliminando posibles espacios iniciales
     extracted_name = client_match.group(
         1).strip() if client_match else "No encontrado"
 
-    # 2. NÚMERO (Busca 'Nº' y captura dígitos, ignorando espacios y mayúsculas)
+    # 2. NÚMERO (Busca 'N° :' o 'N°', y captura dígitos)
     number_match = re.search(
-        r"Nº[\s]*(\d+)", text, re.IGNORECASE)
+        r"N°\s*:\s*(\d+)", text, re.IGNORECASE)
     extracted_number = number_match.group(
         1).strip() if number_match else "No encontrado"
 
-    # 3. FECHA (Busca 'Fecha Emision:' y captura el día, mes y año)
+    # 3. FECHA (Busca 'Fecha de Emisión :' y captura el día, mes y año)
     date_match = re.search(
-        r"Fecha Emision:[\s]*(\d{1,2})\s+de\s+(\w+)\s+del\s+(\d{4})", text, re.IGNORECASE)
+        r"Fecha\s+de\s+Emisión\s*:\s*(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})", text, re.IGNORECASE)
 
     extracted_date = "Error de Formato"
     if date_match:
         try:
-            # Reconstruye la cadena para que datetime la entienda
-            date_str = f"{date_match.group(1)} de {date_match.group(2)} del {date_match.group(3)}"
-            date_obj = datetime.strptime(date_str, '%d de %B del %Y')
+            # Reconstruye la cadena para que datetime la entienda (e.g., "20 de Marzo de 2020")
+            date_str = f"{date_match.group(1)} de {date_match.group(2)} de {date_match.group(3)}"
+            date_obj = datetime.strptime(date_str, '%d de %B de %Y')
             # Formato DD-MM-AA
             extracted_date = date_obj.strftime('%d-%m-%y')
         except Exception:
             extracted_date = "Error de Formato"
 
-    # 4. TOTAL (PESOS) (Busca 'TOTAL $' y captura el número con puntos)
-    total_match = re.search(r"TOTAL[\s\S]*?\$\s*([\d\.]+)", text)
+    # 4. TOTAL (PESOS) (Busca 'Total Cuenta Única Telefónica $ ' y captura el número con puntos)
+    # Patrón: Busca la frase, ignora el '$', y captura el número con puntos o comas.
+    total_match = re.search(
+        r"Total\s+Cuenta\s+Única\s+Telefónica\s+\$\s*([\d\.,]+)", text, re.IGNORECASE)
     extracted_total = total_match.group(1) if total_match else "No encontrado"
 
-    # 5. DESCRIPCIÓN (Busca las líneas de código/descripción SV_65000 y CW_DRIV)
-    # Patrón ajustado al texto limpio
-    description_codes = re.findall(r"(\w{2,}\_\w{2,})", text)
-    extracted_description = " + ".join(
-        description_codes) if description_codes else "No encontrado"
+    # 5. DESCRIPCIÓN (Se mantiene la lógica general o se establece como vacía/fija si no hay patrón)
+    # Ya que no se proporcionó un nuevo patrón de descripción, se deja en "Factura Telefónica"
+    extracted_description = "Factura Telefónica"
 
     # --- FIN DE LA LÓGICA DE EXTRACCIÓN ---
 
-    # ESTA ESTRUCTURA DE SALIDA NO SE MODIFICA
+    # Esta estructura no cambia, define las columnas de salida
     data = [
         {
             "CLIENT": extracted_name,
             "DATE": extracted_date,
             "NUMBER": extracted_number,
-            "DOLLARS": "",  # Columna vacía
-            "PESOS": extracted_total,  # Total extraído
-            "EUROS": "",  # Columna vacía
+            "DOLLARS": "",
+            "PESOS": extracted_total,
+            "EUROS": "",
             "DESCRIPTION": extracted_description
         }
     ]
@@ -108,12 +97,12 @@ def extract_data_from_pdf(pdf_file):
 
 def main():
     st.set_page_config(page_title="PDF a Excel Simple")
-    st.title("Extracción Automática de PDF a Excel")
+    st.title("📄 Extracción Automática de PDF a Excel")
     st.subheader("Paso 1: Cargar el Archivo PDF")
 
     # Componente para subir el archivo PDF
     uploaded_pdf = st.file_uploader(
-        "Sube el archivo PDF (Factura):",
+        "Sube el archivo PDF (Factura Telefónica):",
         type=["pdf"],
         accept_multiple_files=False
     )
@@ -125,31 +114,24 @@ def main():
             st.info("Extrayendo datos y generando archivo...")
 
             try:
-                # Convertimos el archivo cargado a un objeto de memoria
                 pdf_data = io.BytesIO(uploaded_pdf.getvalue())
-
-                # A. Extraer datos y crear el DataFrame de Pandas
                 extracted_data = extract_data_from_pdf(pdf_data)
 
                 # Usamos el DataFrame para asegurar el orden y las columnas
                 df = pd.DataFrame(extracted_data, columns=[
                     "CLIENT", "DATE", "NUMBER", "DOLLARS", "PESOS", "EUROS", "DESCRIPTION"])
 
-                st.subheader("Datos Extraídos (Vista Previa)")
-                st.dataframe(df)  # Mostrar los datos extraídos
+                st.subheader("✅ Datos Extraídos (Vista Previa)")
+                st.dataframe(df)
 
                 # B. Crear el archivo Excel en memoria
                 output = io.BytesIO()
 
-                # Función para limpiar el Total antes de guardarlo en el Excel (quita el punto)
+                # Función para limpiar el Total (quita el punto o coma)
                 def clean_total(x):
-                    # Solo intenta limpiar si no es una cadena vacía o "No encontrado"
-                    if isinstance(x, str) and x.replace('.', '', 1).isdigit():
-                        try:
-                            # Convierte el string "7.725.844" a número 7725844
-                            return float(x.replace('.', ''))
-                        except:
-                            return x  # Retorna el texto si hay error
+                    if isinstance(x, str):
+                        # Quitar todos los puntos y reemplazar la última coma por un punto decimal si existe
+                        return float(x.replace('.', '').replace(',', '.')) if re.match(r'^[\d\.,]+$', x) else x
                     return x
 
                 # Aplicamos la limpieza a la columna PESOS
