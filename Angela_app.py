@@ -8,7 +8,6 @@ import openpyxl  # ¡NUEVO! Para trabajar con tu plantilla Excel existente
 
 # ===============================================
 # FUNCIÓN DE EXTRACCIÓN (Lógica de Negocio)
-# ¡MODIFICADA para usar Regex y extraer todos los datos!
 # ===============================================
 
 
@@ -33,21 +32,25 @@ def extract_data_from_pdf(pdf_file):
         1).strip() if number_match else "No encontrado"
 
     # 3. Fecha de Emisión (Fecha Emision: 14 de Agosto del 2025)
+    # Patrón: un dígito o dos, un espacio, varias letras (mes), ' del ', cuatro dígitos (año)
     date_match = re.search(
         r"Fecha Emision:\s*(\d{1,2}\s+\w+\s+del\s+\d{4})", text, re.IGNORECASE)
     date_str = date_match.group(1) if date_match else "No encontrado"
 
     # Convertir la fecha al formato DD-MM-AA (Ej: "14 de Agosto del 2025" -> "14-08-25")
     try:
+        # Importante: El nombre del mes debe estar en el idioma de la configuración local de Python.
+        # Si da error, el mes podría necesitar ser traducido. Por ahora, asumimos que funciona.
         date_obj = datetime.strptime(date_str, '%d de %B del %Y')
         extracted_date = date_obj.strftime('%d-%m-%y')
     except:
         extracted_date = "Error de Formato"
 
     # 4. Total (TOTAL $ 7.725.844)
+    # Busca el total después de 'TOTAL $ ' y captura los dígitos y puntos.
     total_match = re.search(r"TOTAL\s*\$\s*([\d\.]+)", text)
-    extracted_total = total_match.group(1).replace(
-        '.', '') if total_match else "No encontrado"
+    extracted_total = total_match.group(
+        1) if total_match else "No encontrado"  # Ya no quitamos el punto aquí
 
     # 5. Descripción (Buscar las líneas de detalle: SV_65000 y CW_DRIV)
     description_match = re.findall(r"-\s*(\w+)", text)
@@ -62,7 +65,7 @@ def extract_data_from_pdf(pdf_file):
             "Cliente": extracted_name,
             "Fecha": extracted_date,
             "Numero": extracted_number,
-            "Total": extracted_total,
+            "Total": extracted_total,  # Incluye puntos para el reemplazo
             "Descripcion": extracted_description
         }
     ]
@@ -71,7 +74,6 @@ def extract_data_from_pdf(pdf_file):
 
 # ===============================================
 # INTERFAZ STREAMLIT (Lógica de la Aplicación Web)
-# ¡MODIFICADA para aceptar dos archivos y usar openpyxl!
 # ===============================================
 
 
@@ -111,6 +113,10 @@ def main():
                 # Suponemos que solo hay un conjunto de datos (una factura)
                 data_to_insert = extracted_data[0]
 
+                # Muestra los datos extraídos para verificación
+                st.subheader("✅ Datos Extraídos (Verificación)")
+                st.json(data_to_insert)
+
                 # --- B. Carga y Modificación del Excel con openpyxl ---
 
                 # 1. Cargar el libro de trabajo (workbook) desde el archivo subido
@@ -118,28 +124,44 @@ def main():
                 ws = wb.active  # Seleccionamos la hoja activa (la primera)
 
                 # 2. Encontrar la primera fila vacía para insertar
-                # Empezamos a buscar desde la Fila 15, que es donde inician tus datos
                 insert_row = 15
                 # Busca la primera fila donde la Columna C (Cliente) esté vacía
                 while ws[f'C{insert_row}'].value is not None:
                     insert_row += 1
 
-                # 3. Mapear las columnas según tu ejemplo (Columna D: Fecha, Columna E: Número, Columna K: Descripción)
+                st.info(
+                    f"Se insertarán los datos en la Fila: **{insert_row}** de la hoja activa.")
+
+                # 3. Mapear las columnas según tu ejemplo final
 
                 # Columna C: Nombre del Cliente
+                # ENLASA GENERACION CHILE S.A
                 ws[f'C{insert_row}'] = data_to_insert["Cliente"]
 
                 # Columna D: Fecha
-                ws[f'D{insert_row}'] = data_to_insert["Fecha"]
+                ws[f'D{insert_row}'] = data_to_insert["Fecha"]  # 14-08-25
 
                 # Columna E: Número de Factura
-                ws[f'E{insert_row}'] = data_to_insert["Numero"]
+                ws[f'E{insert_row}'] = data_to_insert["Numero"]  # 228
+
+                # Columna I: Total (PESOS) <-- ¡CORREGIDO!
+                # Quitar puntos y convertir a número (entero o flotante) para que Excel lo interprete como valor.
+                try:
+                    # El valor es "7.725.844". En Chile/España el punto es el separador de miles.
+                    # Lo quitamos para obtener 7725844 y que Python lo vea como un número entero.
+                    total_str_clean = data_to_insert["Total"].replace('.', '')
+                    total_value = int(total_str_clean)
+                    ws[f'I{insert_row}'] = total_value
+                except ValueError:
+                    # Si falla, se escribe el texto tal cual (debería ser raro, pero es un fallback)
+                    ws[f'I{insert_row}'] = data_to_insert["Total"]
 
                 # Columna K: Descripción
+                # SV_65000 + CW_DRIV
                 ws[f'K{insert_row}'] = data_to_insert["Descripcion"]
 
-                # Opcional: Podrías añadir el Total si lo necesitas en alguna columna (Columna H en tu imagen)
-                # ws[f'H{insert_row}'] = data_to_insert["Total"] # Descomentar si quieres añadir el total
+                # Columna F: Fecha del PO (Dejamos vacío, puedes añadirlo si lo extraes)
+                # Columna G: Número del PO (Dejamos vacío)
 
                 # 4. Guardar el Workbook modificado en un buffer de memoria
                 output = io.BytesIO()
@@ -159,7 +181,7 @@ def main():
 
             except Exception as e:
                 st.error(
-                    f"Ocurrió un error al procesar o escribir el archivo. Error: {e}")
+                    f"Ocurrió un error al procesar o escribir el archivo. Por favor, verifica la integridad de tus archivos. Error: {e}")
 
 
 if __name__ == "__main__":
