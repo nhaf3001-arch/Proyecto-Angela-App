@@ -30,6 +30,13 @@ def extract_data_from_pdf(pdf_file):
         first_page = pdf.pages[0]
         # Extraemos el texto completo para las búsquedas
         text = first_page.extract_text()
+        # ⚠️ SOLUCIÓN CRÍTICA: Limpiar el texto de caracteres problemáticos
+        # 1. Reemplaza saltos de línea y retornos de carro por un solo espacio.
+        text = text.replace('\n', ' ').replace('\r', ' ')
+        # 2. Reemplaza múltiples espacios por un solo espacio.
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # Nota: El re.sub necesita importar 're', que ya está arriba.
 
     # --- LÓGICA DE EXTRACCIÓN CON REGEX CORREGIDA ---
 
