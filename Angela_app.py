@@ -33,42 +33,43 @@ def extract_data_from_pdf(pdf_file):
 
     # --- LÓGICA DE EXTRACCIÓN CON REGEX CORREGIDA ---
 
-    # 1. CLIENTE (Ej: ENLASA GENERACION CHILE S.A.)
-    client_match = re.search(r"SEÑOR\(ES\):\s*([^\n]+)", text)
+    # 1. CLIENTE (Más flexible: busca 'SEÑOR(ES):' y captura la línea siguiente)
+    # Usamos un patrón más simple para evitar problemas con saltos de línea inmediatos
+    client_match = re.search(
+        r"SEÑOR\(ES\):[\s]*([^\n\r]+)", text, re.IGNORECASE)
     extracted_name = client_match.group(
         1).strip() if client_match else "No encontrado"
 
-    # 2. NÚMERO (Ej: 228)
+    # 2. NÚMERO (Busca 'Nº' y captura dígitos, ignorando espacios y mayúsculas)
     number_match = re.search(
-        r"FACTURA ELECTRONICA\s*Nº(\d+)", text, re.IGNORECASE)
+        r"Nº[\s]*(\d+)", text, re.IGNORECASE)
     extracted_number = number_match.group(
         1).strip() if number_match else "No encontrado"
 
-    # 3. FECHA (Ej: 14-08-25)
-    # Patrón: día(1 o 2 dígitos) + mes(letras) + año(4 dígitos)
+    # 3. FECHA (Busca 'Fecha Emision:' y captura el día, mes y año)
     date_match = re.search(
-        r"Fecha Emision:\s*(\d{1,2})\s+de\s+(\w+)\s+del\s+(\d{4})", text, re.IGNORECASE)
+        r"Fecha Emision:[\s]*(\d{1,2})\s+de\s+(\w+)\s+del\s+(\d{4})", text, re.IGNORECASE)
 
     extracted_date = "Error de Formato"
     if date_match:
         try:
-            # Reconstruye: "14 de Agosto del 2025"
+            # Reconstruye la cadena para que datetime la entienda
             date_str = f"{date_match.group(1)} de {date_match.group(2)} del {date_match.group(3)}"
             date_obj = datetime.strptime(date_str, '%d de %B del %Y')
             extracted_date = date_obj.strftime('%d-%m-%y')  # Formato DD-MM-AA
         except Exception:
             extracted_date = "Error de Formato"
 
-    # 4. TOTAL (PESOS) (Ej: 7.725.844)
-    # Buscamos el total después de 'TOTAL $ ' y capturamos los dígitos y puntos.
-    total_match = re.search(r"TOTAL\s*\$\s*([\d\.]+)", text)
+    # 4. TOTAL (PESOS) (Busca 'TOTAL $' y captura el número con puntos)
+    # Usa [\s\S]*? para capturar cualquier cosa entre TOTAL y el valor, en caso de saltos de línea
+    total_match = re.search(r"TOTAL[\s\S]*?\$\s*([\d\.]+)", text)
     extracted_total = total_match.group(1) if total_match else "No encontrado"
 
-    # 5. DESCRIPCIÓN (Ej: SV_65000 + CW_DRIV)
-    # Buscamos los códigos de servicio
-    description_match = re.findall(r"-\s*(\w+)", text)
+    # 5. DESCRIPCIÓN (Busca las líneas de código/descripción SV_65000 y CW_DRIV)
+    # Basado en los códigos cortos del detalle de la factura
+    description_codes = re.findall(r"-\s*(\w{2,}\_\w{2,})", text)
     extracted_description = " + ".join(
-        description_match) if description_match else "No encontrado"
+        description_codes) if description_codes else "No encontrado"
 
     # --- FIN DE LA LÓGICA DE EXTRACCIÓN ---
 
