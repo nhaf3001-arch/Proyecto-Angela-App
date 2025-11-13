@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
-import io  # Para manejar archivos en memoria
 import re  # Para usar Expresiones Regulares (Regex)
 from datetime import datetime  # Para formatear la fecha
 import locale  # Para forzar el idioma español en la fecha
+# Usamos pypdf, pero lo llamamos PyPDF2 para coincidir con tu código
+import pypdf as PyPDF2
+import io
 
 # ===============================================
 # FUNCIÓN DE EXTRACCIÓN (Lógica de Negocio)
@@ -16,32 +17,37 @@ def extract_data_from_pdf(pdf_file):
 
     # Intentar establecer el idioma español para manejar el nombre del mes ("Agosto")
     try:
-        # Intenta la configuración para Linux/Mac
         locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
     except locale.Error:
         try:
-            # Intenta la configuración para Windows
             locale.setlocale(locale.LC_TIME, 'Spanish_Spain.1252')
         except locale.Error:
-            # Si falla, continuará, aunque la fecha podría fallar si el sistema no soporta el idioma.
             pass
 
-    with pdfplumber.open(pdf_file) as pdf:
-        first_page = pdf.pages[0]
-        # Extraemos el texto completo para las búsquedas
-        text = first_page.extract_text()
-        # ⚠️ SOLUCIÓN CRÍTICA: Limpiar el texto de caracteres problemáticos
+    # ⚠️ SECCIÓN CRÍTICA: USANDO PYPDF2 PARA EXTRAER EL TEXTO
+    text = ''
+    try:
+        # Streamlit pasa el archivo como BytesIO, lo abrimos con PyPDF2.PdfReader
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+
+        for page_num in range(len(pdf_reader.pages)):
+            page = pdf_reader.pages[page_num]
+            text += page.extract_text()
+
+    except Exception as e:
+        # Si PyPDF2 falla, el texto será vacío, y los campos serán "No encontrado"
+        print(f"Error al leer PDF con PyPDF2: {e}")
+
+    # 🟢 LIMPIEZA CRÍTICA: Se mantiene la limpieza de texto para las búsquedas.
+    if text:  # Solo si se pudo extraer algo de texto
         # 1. Reemplaza saltos de línea y retornos de carro por un solo espacio.
         text = text.replace('\n', ' ').replace('\r', ' ')
         # 2. Reemplaza múltiples espacios por un solo espacio.
         text = re.sub(r'\s+', ' ', text).strip()
 
-        # Nota: El re.sub necesita importar 're', que ya está arriba.
-
     # --- LÓGICA DE EXTRACCIÓN CON REGEX CORREGIDA ---
 
     # 1. CLIENTE (Más flexible: busca 'SEÑOR(ES):' y captura la línea siguiente)
-    # Usamos un patrón más simple para evitar problemas con saltos de línea inmediatos
     client_match = re.search(
         r"SEÑOR\(ES\):[\s]*([^\n\r]+)", text, re.IGNORECASE)
     extracted_name = client_match.group(
@@ -63,32 +69,32 @@ def extract_data_from_pdf(pdf_file):
             # Reconstruye la cadena para que datetime la entienda
             date_str = f"{date_match.group(1)} de {date_match.group(2)} del {date_match.group(3)}"
             date_obj = datetime.strptime(date_str, '%d de %B del %Y')
-            extracted_date = date_obj.strftime('%d-%m-%y')  # Formato DD-MM-AA
+            # Formato DD-MM-AA
+            extracted_date = date_obj.strftime('%d-%m-%y')
         except Exception:
             extracted_date = "Error de Formato"
 
     # 4. TOTAL (PESOS) (Busca 'TOTAL $' y captura el número con puntos)
-    # Usa [\s\S]*? para capturar cualquier cosa entre TOTAL y el valor, en caso de saltos de línea
     total_match = re.search(r"TOTAL[\s\S]*?\$\s*([\d\.]+)", text)
     extracted_total = total_match.group(1) if total_match else "No encontrado"
 
     # 5. DESCRIPCIÓN (Busca las líneas de código/descripción SV_65000 y CW_DRIV)
-    # Basado en los códigos cortos del detalle de la factura
-    description_codes = re.findall(r"-\s*(\w{2,}\_\w{2,})", text)
+    # Patrón ajustado al texto limpio
+    description_codes = re.findall(r"(\w{2,}\_\w{2,})", text)
     extracted_description = " + ".join(
         description_codes) if description_codes else "No encontrado"
 
     # --- FIN DE LA LÓGICA DE EXTRACCIÓN ---
 
-    # ESTA ESTRUCTURA DEBE COINCIDIR CON LA TABLA DE SALIDA QUE PEDISTE
+    # ESTA ESTRUCTURA DE SALIDA NO SE MODIFICA
     data = [
         {
             "CLIENT": extracted_name,
             "DATE": extracted_date,
             "NUMBER": extracted_number,
-            "DOLLARS": "",             # Columna vacía
+            "DOLLARS": "",  # Columna vacía
             "PESOS": extracted_total,  # Total extraído
-            "EUROS": "",               # Columna vacía
+            "EUROS": "",  # Columna vacía
             "DESCRIPTION": extracted_description
         }
     ]
@@ -102,7 +108,7 @@ def extract_data_from_pdf(pdf_file):
 
 def main():
     st.set_page_config(page_title="PDF a Excel Simple")
-    st.title("📄 Extracción Automática de PDF a Excel")
+    st.title("Extracción Automática de PDF a Excel")
     st.subheader("Paso 1: Cargar el Archivo PDF")
 
     # Componente para subir el archivo PDF
@@ -127,9 +133,9 @@ def main():
 
                 # Usamos el DataFrame para asegurar el orden y las columnas
                 df = pd.DataFrame(extracted_data, columns=[
-                                  "CLIENT", "DATE", "NUMBER", "DOLLARS", "PESOS", "EUROS", "DESCRIPTION"])
+                    "CLIENT", "DATE", "NUMBER", "DOLLARS", "PESOS", "EUROS", "DESCRIPTION"])
 
-                st.subheader("✅ Datos Extraídos (Vista Previa)")
+                st.subheader("Datos Extraídos (Vista Previa)")
                 st.dataframe(df)  # Mostrar los datos extraídos
 
                 # B. Crear el archivo Excel en memoria
