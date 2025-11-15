@@ -66,25 +66,34 @@ def extract_data_from_pdf(pdf_file):
         extracted_date = "Error de Formato (Inicial)"
 
         if date_match:
-            # ⚠️ Bloque try/except correctamente indentado y cerrado.
             try:
                 day = date_match.group(1)
-                month_es = date_match.group(2).lower()
+                # Nombre original del mes (e.g., "Marzo")
+                month_es = date_match.group(2)
                 year = date_match.group(3)
 
-                # APLICACIÓN DEL MAPEO DE MESES
-                month_en = MONTH_MAPPING.get(month_es, month_es)
+                # --- ESTRATEGIA DUAL-LOCALE (PARA LOCAL Y CLOUD) ---
 
-                # Crear la cadena de fecha usando el mes en inglés/mapeado
-                date_str = f"{day} de {month_en} de {year}"
+                # 1. INTENTO ESPAÑOL (Funciona en local si el locale se configuró con éxito)
+                try:
+                    date_str = f"{day} de {month_es} de {year}"
+                    date_obj = datetime.strptime(date_str, '%d de %B de %Y')
+                    extracted_date = date_obj.strftime('%d-%m-%y')
 
-                # Intentar el parseo
-                date_obj = datetime.strptime(date_str, '%d de %B de %Y')
+                # Si falla (generalmente en la nube donde el locale falló)
+                except ValueError:
+                    # 2. FALLBACK A INGLÉS (Usando el mapeo para Streamlit Cloud)
+                    month_es_lower = month_es.lower()
+                    month_en = MONTH_MAPPING.get(month_es_lower, month_es)
 
-                extracted_date = date_obj.strftime('%d-%m-%y')
+                    # Usamos la versión en inglés/mapeada
+                    date_str = f"{day} de {month_en} de {year}"
+
+                    date_obj = datetime.strptime(date_str, '%d de %B de %Y')
+                    extracted_date = date_obj.strftime('%d-%m-%y')
 
             except Exception:
-                # Este except está alineado con el try interno (dentro del if)
+                # Este except captura fallas si ambos intentos (español e inglés/mapeado) fallan
                 extracted_date = "Error de Formato (Parseo final)"
 
         # 4. TOTAL (PESOS)
