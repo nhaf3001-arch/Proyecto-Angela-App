@@ -7,23 +7,31 @@ import locale  # Para forzar el idioma español en la fecha
 import io
 import xlsxwriter
 
+# ⚠️ CORRECCIÓN CLAVE 1: Mapeo de meses
+# Mapeo de meses en español a inglés para evitar problemas de 'locale' en servidores Linux
+MONTH_MAPPING = {
+    'enero': 'January', 'febrero': 'February', 'marzo': 'March',
+    'abril': 'April', 'mayo': 'May', 'junio': 'June',
+    'julio': 'July', 'agosto': 'August', 'septiembre': 'September',
+    'octubre': 'October', 'noviembre': 'November', 'diciembre': 'December'
+}
+
+# Se intenta el locale, pero no es crucial si falla.
+try:
+    locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
+except locale.Error:
+    try:
+        locale.setlocale(locale.LC_TIME, 'Spanish_Spain.1252')
+    except locale.Error:
+        pass  # Si falla, el mapeo de meses lo soluciona.
+
 
 # ===============================================
 # FUNCIÓN DE EXTRACCIÓN (Lógica de Negocio)
 # ===============================================
 
-
 def extract_data_from_pdf(pdf_file):
     """Extrae el Nombre, la Fecha, el Número, el Total y la Descripción del PDF."""
-
-    # Intentar establecer el idioma español para manejar el nombre del mes
-    try:
-        locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
-    except locale.Error:
-        try:
-            locale.setlocale(locale.LC_TIME, 'Spanish_Spain.1252')
-        except locale.Error:
-            pass
 
     # Usamos try/except para manejar errores de archivos no válidos individualmente
     try:
@@ -35,33 +43,51 @@ def extract_data_from_pdf(pdf_file):
             text = text.replace('\n', ' ').replace('\r', ' ')
             text = re.sub(r'\s+', ' ', text).strip()
 
-        # --- LÓGICA DE EXTRACCIÓN CON REGEX (SE MANTIENE LA LÓGICA) ---
+        # --- LÓGICA DE EXTRACCIÓN CON REGEX ---
 
-        # 1. CLIENTE (SR.(A) NATHALY HAYDEE ALARCON FERRES)
+        # 1. CLIENTE
         client_match = re.search(
             r"SR\.\(?A\)?[\s:]*([^\n\r]+?)(?:\s+RUT|[\n\r]|$)", text, re.IGNORECASE)
         extracted_name = client_match.group(
             1).strip() if client_match else "No encontrado"
 
-        # 2. NÚMERO (N° : 134877688)
+        # 2. NÚMERO
         number_match = re.search(
             r"N°\s*:\s*(\d+)", text, re.IGNORECASE)
         extracted_number = number_match.group(
             1).strip() if number_match else "No encontrado"
 
-        # 3. FECHA (Fecha de Emisión : 20 de Marzo de 2020 -> 20-03-20)
+        # 3. FECHA (Regex más robusta)
         date_match = re.search(
-            r"Fecha\s+de\s+Emisión\s*:\s*(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})", text, re.IGNORECASE)
-        extracted_date = "Error de Formato"
-        if date_match:
-            try:
-                date_str = f"{date_match.group(1)} de {date_match.group(2)} de {date_match.group(3)}"
-                date_obj = datetime.strptime(date_str, '%d de %B de %Y')
-                extracted_date = date_obj.strftime('%d-%m-%y')
-            except Exception:
-                extracted_date = "Error de Formato"
+            r"Fecha\s+(?:de\s+)?Emisi[óo]n\s*:\s*(\d{1,2})\s+de\s+(\w+)\s+(?:del|de)\s+(\d{4})",
+            text,
+            re.IGNORECASE
+        )
+        extracted_date = "Error de Formato (Inicial)"
 
-        # 4. TOTAL (PESOS) (Total Cuenta Única Telefónica $ 20.586)
+        if date_match:
+            # ⚠️ Bloque try/except correctamente indentado y cerrado.
+            try:
+                day = date_match.group(1)
+                month_es = date_match.group(2).lower()
+                year = date_match.group(3)
+
+                # APLICACIÓN DEL MAPEO DE MESES
+                month_en = MONTH_MAPPING.get(month_es, month_es)
+
+                # Crear la cadena de fecha usando el mes en inglés/mapeado
+                date_str = f"{day} de {month_en} de {year}"
+
+                # Intentar el parseo
+                date_obj = datetime.strptime(date_str, '%d de %B de %Y')
+
+                extracted_date = date_obj.strftime('%d-%m-%y')
+
+            except Exception:
+                # Este except está alineado con el try interno (dentro del if)
+                extracted_date = "Error de Formato (Parseo final)"
+
+        # 4. TOTAL (PESOS)
         total_match = re.search(
             r"Total\s+Cuenta\s+Única\s+Telefónica\s+\$\s*([\d\.,]+)", text, re.IGNORECASE)
         extracted_total = total_match.group(
@@ -81,6 +107,7 @@ def extract_data_from_pdf(pdf_file):
             "DESCRIPTION": extracted_description
         }
 
+    # Este es el except del bloque try principal (errores de archivo/pdfplumber)
     except Exception as e:
         # Retorna una fila de error si el archivo no puede ser procesado
         return {
@@ -99,11 +126,10 @@ def extract_data_from_pdf(pdf_file):
 
 
 def main():
-    st.set_page_config(page_title="PDF a Excel Múltiple")
+    st.set_page_config(page_title="PDF a Excel Múltiple", layout="wide")
     st.title("📂 Extracción Consolidada de Múltiples PDFs a Excel")
     st.subheader("Paso 1: Cargar Archivos PDF")
 
-    # ⚠️ CAMBIO CLAVE: Cambiar a accept_multiple_files=True
     uploaded_pdfs = st.file_uploader(
         "Sube uno o más archivos PDF (Facturas):",
         type=["pdf"],
@@ -114,62 +140,58 @@ def main():
         st.success(f"Se cargaron **{len(uploaded_pdfs)}** archivos.")
 
         if st.button("Procesar y Consolidar en Excel"):
-            st.info(
-                f"Iniciando extracción y consolidación de {len(uploaded_pdfs)} archivos...")
 
-            # Lista para almacenar los resultados de TODAS las facturas
             consolidated_data = []
 
-            # ⚠️ CAMBIO CLAVE: Iterar sobre cada archivo cargado
-            for uploaded_pdf in uploaded_pdfs:
-                try:
-                    # Convertimos el archivo cargado a un objeto de memoria
-                    pdf_data = io.BytesIO(uploaded_pdf.getvalue())
+            with st.spinner(f"Iniciando extracción y consolidación de {len(uploaded_pdfs)} archivos..."):
 
-                    # Extraer datos del PDF y agregar al resultado consolidado
-                    result = extract_data_from_pdf(pdf_data)
-                    # Agregamos el nombre del archivo al resultado para referencia
-                    result['FILE_NAME'] = uploaded_pdf.name
-                    consolidated_data.append(result)
+                # Itera sobre CADA archivo cargado
+                for uploaded_pdf in uploaded_pdfs:
+                    try:
+                        pdf_data = io.BytesIO(uploaded_pdf.getvalue())
+                        result = extract_data_from_pdf(pdf_data)
 
-                except Exception as e:
-                    st.warning(
-                        f"No se pudo procesar {uploaded_pdf.name}. Error: {e}")
-                    # Agregar una fila de error explícita si el fallo ocurre fuera de la función
-                    consolidated_data.append({
-                        "CLIENT": f"ERROR FATAL: {uploaded_pdf.name}",
-                        "DATE": "N/A",
-                        "NUMBER": "N/A",
-                        "DOLLARS": "N/A",
-                        "PESOS": "N/A",
-                        "EUROS": "N/A",
-                        "DESCRIPTION": "N/A",
-                        "FILE_NAME": uploaded_pdf.name
-                    })
+                        # Agrega el nombre del archivo
+                        result['FILE_NAME'] = uploaded_pdf.name
+                        consolidated_data.append(result)
 
-            # A. Crear el DataFrame final con todos los datos
+                    except Exception as e:
+                        st.warning(
+                            f"No se pudo procesar {uploaded_pdf.name}. Error: {e}")
+
+                        consolidated_data.append({
+                            "CLIENT": f"ERROR FATAL: {uploaded_pdf.name}",
+                            "DATE": "N/A",
+                            "NUMBER": "N/A",
+                            "DOLLARS": "N/A",
+                            "PESOS": "N/A",
+                            "EUROS": "N/A",
+                            "DESCRIPTION": "N/A",
+                            "FILE_NAME": uploaded_pdf.name
+                        })
+
+            # A. Crear el DataFrame final
             column_order = ["FILE_NAME", "CLIENT", "DATE",
                             "NUMBER", "DOLLARS", "PESOS", "EUROS", "DESCRIPTION"]
             df = pd.DataFrame(consolidated_data, columns=column_order)
 
             st.subheader("✅ Datos Consolidados (Vista Previa)")
-            st.dataframe(df)
+            st.dataframe(df, width='stretch')
 
             # B. Crear el archivo Excel en memoria
             output = io.BytesIO()
 
-            # Función para limpiar el Total (se mantiene la lógica)
             def clean_total(x):
                 if isinstance(x, str):
                     if re.match(r'^[\d\.,]+$', x):
-                        # Quitar todos los puntos y reemplazar la última coma por un punto decimal si existe
+                        # Reemplazamos todos los puntos y la última coma por un punto decimal
                         return float(x.replace('.', '').replace(',', '.'))
                     return x
                 return x
 
-            # Aplicamos la limpieza a la columna PESOS
             df['PESOS'] = df['PESOS'].apply(clean_total)
 
+            # Uso de xlsxwriter (instalado via requirements.txt)
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False, sheet_name='Datos Facturas')
             output.seek(0)
@@ -180,7 +202,8 @@ def main():
                 label="Descargar Excel de Facturas",
                 data=output.read(),
                 file_name=f"Facturas_Consolidadas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_button"
             )
 
             st.balloons()
