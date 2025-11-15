@@ -5,6 +5,7 @@ import re  # Para usar Expresiones Regulares (Regex)
 from datetime import datetime  # Para formatear la fecha
 import locale  # Para forzar el idioma español en la fecha
 import io
+import xlsxwriter
 
 
 # ===============================================
