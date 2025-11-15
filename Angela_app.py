@@ -7,8 +7,8 @@ import locale  # Para forzar el idioma español en la fecha
 import io
 import xlsxwriter
 
-# ⚠️ CORRECCIÓN CLAVE 1: Mapeo de meses
-# Mapeo de meses en español a inglés para evitar problemas de 'locale' en servidores Linux
+# ⚠️ CONFIGURACIÓN GLOBAL (Mapeo de meses y Locale)
+# Se mantiene fuera de la clase ya que son constantes de configuración
 MONTH_MAPPING = {
     'enero': 'January', 'febrero': 'February', 'marzo': 'March',
     'abril': 'April', 'mayo': 'May', 'junio': 'June',
@@ -16,96 +16,162 @@ MONTH_MAPPING = {
     'octubre': 'October', 'noviembre': 'November', 'diciembre': 'December'
 }
 
-# Se intenta el locale, pero no es crucial si falla.
+# Se intenta configurar el locale.
 try:
     locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
 except locale.Error:
     try:
         locale.setlocale(locale.LC_TIME, 'Spanish_Spain.1252')
     except locale.Error:
-        pass  # Si falla, el mapeo de meses lo soluciona.
+        pass
 
 
 # ===============================================
-# FUNCIÓN DE EXTRACCIÓN (Lógica de Negocio)
+# CLASE DE EXTRACCIÓN (PROGRAMACIÓN ORIENTADA A OBJETOS)
 # ===============================================
 
-def extract_data_from_pdf(pdf_file):
-    """Extrae el Nombre, la Fecha, el Número, el Total y la Descripción del PDF."""
+class FacturaExtractor:
+    """
+    Encapsula la lógica y las reglas de extracción para un tipo de documento.
+    """
 
-    # Usamos try/except para manejar errores de archivos no válidos individualmente
-    try:
-        with pdfplumber.open(pdf_file) as pdf:
-            first_page = pdf.pages[0]
-            text = first_page.extract_text()
+    # REGLAS DE EXTRACCIÓN: Ahora son atributos de la clase.
+    EXTRACTION_RULES = {
+        "CLIENT": [
+            # Regla 1 (Original): Busca SR(A): NOMBRE...
+            r"SR\.\(?A\)?[\s:]*([^\n\r]+?)(?:\s+RUT|[\n\r]|$)",
+            # Regla 2 (Flexible): Busca cualquier nombre después de "Hola" o sin prefijo formal
+            r"(?:SR\.\(?A\)?|Hola|Estimado\s*:\s*)?([^\n\r]+?)(?:\s+RUT|[\n\r]|$)"
+        ],
 
-            # Limpieza crítica del texto
-            text = text.replace('\n', ' ').replace('\r', ' ')
-            text = re.sub(r'\s+', ' ', text).strip()
+        "NUMBER": [
+            # Regla 1 (Única): Busca N°: 12345
+            r"N°\s*:\s*(\d+)"
+        ],
 
-        # --- LÓGICA DE EXTRACCIÓN CON REGEX ---
+        "DATE": [
+            # Regla A (Original/Larga): 10 de Febrero de 2020
+            {"regex": r"Fecha\s+(?:de\s+)?Emisi[óo]n\s*:\s*(\d{1,2})\s+de\s+(\w+)\s+(?:del|de)\s+(\d{4})",
+             "format": "LONG_FORMAT"},
+            # Regla B (Nueva/Corta): 10-02-20 o 10/02/2020
+            {"regex": r"Fecha\s*:\s*(\d{1,2})[\s\-\/](\d{1,2})[\s\-\/](\d{2,4})",
+             "format": "DD_MM_YY"}
+        ],
 
-        # 1. CLIENTE
-        client_match = re.search(
-            r"SR\.\(?A\)?[\s:]*([^\n\r]+?)(?:\s+RUT|[\n\r]|$)", text, re.IGNORECASE)
-        extracted_name = client_match.group(
-            1).strip() if client_match else "No encontrado"
+        "TOTAL": [
+            # Regla 1 (Única): Busca Total Cuenta Única Telefónica $ 123.456
+            r"Total\s+Cuenta\s+Única\s+Telefónica\s+\$\s*([\d\.,]+)"
+        ]
+    }
 
-        # 2. NÚMERO
-        number_match = re.search(
-            r"N°\s*:\s*(\d+)", text, re.IGNORECASE)
-        extracted_number = number_match.group(
-            1).strip() if number_match else "No encontrado"
+    def __init__(self, pdf_file):
+        """Inicializa el extractor leyendo y limpiando el texto del PDF."""
+        try:
+            with pdfplumber.open(pdf_file) as pdf:
+                first_page = pdf.pages[0]
+                text = first_page.extract_text()
 
-        # 3. FECHA (Regex más robusta)
-        date_match = re.search(
-            r"Fecha\s+(?:de\s+)?Emisi[óo]n\s*:\s*(\d{1,2})\s+de\s+(\w+)\s+(?:del|de)\s+(\d{4})",
-            text,
-            re.IGNORECASE
-        )
-        extracted_date = "Error de Formato (Inicial)"
+                # Limpieza crítica del texto
+                text = text.replace('\n', ' ').replace('\r', ' ')
+                self.text = re.sub(r'\s+', ' ', text).strip()
+        except Exception as e:
+            self.text = ""
+            st.warning(f"Error al cargar texto del PDF: {e}")
 
-        if date_match:
+    def _parse_date(self, date_match, date_format_type):
+        """
+        Método privado para parsear la fecha basándose en el tipo de formato.
+        Utiliza el mapeo global MONTH_MAPPING.
+        """
+        extracted_date = "Error de Formato (Parseo)"
+
+        if date_format_type == "LONG_FORMAT":
             try:
                 day = date_match.group(1)
-                # Nombre original del mes (e.g., "Marzo")
                 month_es = date_match.group(2)
                 year = date_match.group(3)
 
-                # --- ESTRATEGIA DUAL-LOCALE (PARA LOCAL Y CLOUD) ---
-
-                # 1. INTENTO ESPAÑOL (Funciona en local si el locale se configuró con éxito)
+                # Intento con locale y fallback con mapeo
                 try:
                     date_str = f"{day} de {month_es} de {year}"
                     date_obj = datetime.strptime(date_str, '%d de %B de %Y')
-                    extracted_date = date_obj.strftime('%d-%m-%y')
-
-                # Si falla (generalmente en la nube donde el locale falló)
                 except ValueError:
-                    # 2. FALLBACK A INGLÉS (Usando el mapeo para Streamlit Cloud)
                     month_es_lower = month_es.lower()
                     month_en = MONTH_MAPPING.get(month_es_lower, month_es)
-
-                    # Usamos la versión en inglés/mapeada
                     date_str = f"{day} de {month_en} de {year}"
-
                     date_obj = datetime.strptime(date_str, '%d de %B de %Y')
-                    extracted_date = date_obj.strftime('%d-%m-%y')
+
+                extracted_date = date_obj.strftime('%d-%m-%y')
 
             except Exception:
-                # Este except captura fallas si ambos intentos (español e inglés/mapeado) fallan
-                extracted_date = "Error de Formato (Parseo final)"
+                extracted_date = "Error de Formato (Largo Fallido)"
 
-        # 4. TOTAL (PESOS)
-        total_match = re.search(
-            r"Total\s+Cuenta\s+Única\s+Telefónica\s+\$\s*([\d\.,]+)", text, re.IGNORECASE)
-        extracted_total = total_match.group(
-            1) if total_match else "No encontrado"
+        elif date_format_type == "DD_MM_YY":
+            try:
+                day = date_match.group(1).zfill(2)
+                month = date_match.group(2).zfill(2)
+                year = date_match.group(3)
+                # Asegurar año de 4 dígitos si viene de 2
+                if len(year) == 2:
+                    year = f"20{year}"
+
+                date_str = f"{day}-{month}-{year}"
+                date_obj = datetime.strptime(date_str, '%d-%m-%Y')
+                extracted_date = date_obj.strftime('%d-%m-%y')
+
+            except Exception:
+                extracted_date = "Error de Formato (Corto Fallido)"
+
+        return extracted_date
+
+    def _try_find(self, field_name):
+        """
+        Método privado que prueba secuencialmente los patrones para un campo.
+        """
+        patterns = self.EXTRACTION_RULES.get(field_name, [])
+
+        for pattern in patterns:
+            if isinstance(pattern, dict):
+                # Para reglas complejas como la Fecha
+                regex = pattern.get("regex")
+            else:
+                # Para reglas sencillas (Cliente, Número, Total)
+                regex = pattern
+
+            # Buscamos en el texto limpio del PDF
+            match = re.search(regex, self.text, re.IGNORECASE)
+            if match:
+                # Si el patrón es simple, devolvemos el grupo 1, el objeto match y el patrón.
+                result = match.group(1).strip() if len(
+                    match.groups()) > 0 else ""
+                return result, match, pattern
+
+        # Si no se encuentra ninguna coincidencia
+        return "No encontrado", None, None
+
+    def extract_all(self):
+        """Método principal que ejecuta todas las extracciones."""
+
+        # 1. CLIENTE
+        extracted_name, _, _ = self._try_find("CLIENT")
+
+        # 2. NÚMERO
+        extracted_number, _, _ = self._try_find("NUMBER")
+
+        # 3. FECHA
+        extracted_date = "No encontrado"
+        _, date_match, date_rule = self._try_find("DATE")
+
+        if date_match and date_rule:
+            extracted_date = self._parse_date(date_match, date_rule["format"])
+
+        # 4. TOTAL
+        extracted_total, _, _ = self._try_find("TOTAL")
 
         # 5. DESCRIPCIÓN
         extracted_description = "Factura Telefónica"
 
-        # ESTA ESTRUCTURA DEBE COINCIDIR CON LA TABLA DE SALIDA
+        # Retorna el diccionario de resultados
         return {
             "CLIENT": extracted_name,
             "DATE": extracted_date,
@@ -116,7 +182,20 @@ def extract_data_from_pdf(pdf_file):
             "DESCRIPTION": extracted_description
         }
 
-    # Este es el except del bloque try principal (errores de archivo/pdfplumber)
+
+# ===============================================
+# FUNCIÓN DE ENTRADA (Wrapper)
+# ===============================================
+
+def extract_data_from_pdf(pdf_file):
+    """
+    Función de entrada que crea una instancia del extractor
+    y llama a su método principal para obtener los datos.
+    """
+    try:
+        extractor = FacturaExtractor(pdf_file)
+        return extractor.extract_all()
+
     except Exception as e:
         # Retorna una fila de error si el archivo no puede ser procesado
         return {
@@ -158,6 +237,7 @@ def main():
                 for uploaded_pdf in uploaded_pdfs:
                     try:
                         pdf_data = io.BytesIO(uploaded_pdf.getvalue())
+                        # Llama a la función wrapper, que ahora usa la clase OOP
                         result = extract_data_from_pdf(pdf_data)
 
                         # Agrega el nombre del archivo
@@ -192,15 +272,24 @@ def main():
 
             def clean_total(x):
                 if isinstance(x, str):
-                    if re.match(r'^[\d\.,]+$', x):
-                        # Reemplazamos todos los puntos y la última coma por un punto decimal
-                        return float(x.replace('.', '').replace(',', '.'))
-                    return x
+                    # Maneja el caso de "No encontrado"
+                    if x in ["No encontrado", "N/A"]:
+                        return x
+
+                    # Reemplazamos todos los puntos y la última coma por un punto decimal
+                    cleaned_x = x.replace('.', '')
+                    cleaned_x = cleaned_x.replace(',', '.')
+
+                    try:
+                        return float(cleaned_x)
+                    except ValueError:
+                        return x
+
                 return x
 
             df['PESOS'] = df['PESOS'].apply(clean_total)
 
-            # Uso de xlsxwriter (instalado via requirements.txt)
+            # Uso de xlsxwriter
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False, sheet_name='Datos Facturas')
             output.seek(0)
