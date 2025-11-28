@@ -6,9 +6,11 @@ from datetime import datetime  # Para formatear la fecha
 import locale  # Para forzar el idioma español en la fecha
 import io
 import xlsxwriter
+# Nueva librería para leer archivos Word (.docx)
 import docx
 
 # ⚠️ CONFIGURACIÓN GLOBAL (Mapeo de meses y Locale)
+# Se mantiene fuera de la clase ya que son constantes de configuración
 MONTH_MAPPING = {
     'enero': 'January', 'febrero': 'February', 'marzo': 'March',
     'abril': 'April', 'mayo': 'May', 'junio': 'June',
@@ -79,19 +81,69 @@ class FacturaExtractor:
     def __init__(self, pdf_file):
         """Inicializa el extractor leyendo y limpiando el texto del PDF."""
 
+        # 🎯 Almacenamos el objeto pdfplumber y el texto completo (limpiado de espacios)
+        # y el texto de la primera página (para la extracción de códigos específicos)
         try:
             with pdfplumber.open(pdf_file) as pdf:
-                # self.raw_text no se usa en este caso pero se mantiene por si es necesario
-                raw_text = "".join(page.extract_text() for page in pdf.pages)
-                self.raw_text = raw_text
-
-                # self.text es la versión plana, crucial para la mayoría de regex
-                text = raw_text.replace('\n', ' ').replace('\r', ' ')
+                # Texto Completo (para campos generales como total, fecha, etc.)
+                text = "".join(page.extract_text() for page in pdf.pages)
+                text = text.replace('\n', ' ').replace('\r', ' ')
                 self.text = re.sub(r'\s+', ' ', text).strip()
+
+                # Texto de la Primera Página (para los códigos específicos)
+                if len(pdf.pages) > 0:
+                    self.page_1_text = pdf.pages[0].extract_text()
+                else:
+                    self.page_1_text = ""
+
         except Exception as e:
             self.text = ""
-            self.raw_text = ""
+            self.page_1_text = ""
             st.warning(f"Error al cargar texto del PDF: {e}")
+
+    # ===============================================
+    # 🎯 NUEVA FUNCIÓN PARA EXTRAER CÓDIGOS ESPECÍFICOS (BASADA EN TU SCRIPT ORIGINAL)
+    # ===============================================
+    def _extract_product_codes_from_page(self):
+        """
+        Extrae y limpia el texto de la primera página para obtener solo los códigos de producto.
+        """
+        if not self.page_1_text:
+            return "No hay contenido en Pág. 1"
+
+        full_text = self.page_1_text.strip()
+
+        # 1. Primera Limpieza: Extraer el Bloque de Detalles (Flexible)
+        # Busca el bloque que comienza en 'Adic.*' y termina en 'Referencias:' O 'MONTO NETO'.
+        # re.DOTALL: permite que . coincida con saltos de línea.
+        block_pattern = r"Adic\.\*\s*(.*?)\s*(?:Referencias:|MONTO NETO)"
+        block_match = re.search(block_pattern, full_text, re.DOTALL)
+
+        extracted_details = ""
+        if block_match:
+            # group(1) contiene el contenido capturado (.*?)
+            extracted_details = block_match.group(1).strip()
+        else:
+            return "Bloque Adic.* no encontrado"
+
+        # 2. Segunda Limpieza: Extraer Códigos de Producto (SAT-DUST, SVSERV_5000, etc.)
+        # Patrón: inicio de línea (^), guion y espacio (- ), luego captura la primera palabra (\S+).
+        code_pattern = r"^- \s*(\S+)\s*"
+
+        # re.MULTILINE: permite que ^ funcione al inicio de cada línea.
+        product_codes = re.findall(
+            code_pattern, extracted_details, re.MULTILINE)
+
+        # 3. Formatear la salida final
+        if not product_codes:
+            return "No se encontraron códigos"
+
+        # Unimos los códigos con un separador simple (ej: ' | ') para el Excel
+        return " | ".join(product_codes)
+
+    # ===============================================
+    # MÉTODOS EXISTENTES
+    # ===============================================
 
     def _parse_date(self, date_match, date_format_type):
         """ Método privado para parsear la fecha basándose en el tipo de formato. """
@@ -137,7 +189,6 @@ class FacturaExtractor:
 
             search_flags = re.IGNORECASE if field_name not in [
                 "DESCRIPTION"] else 0
-            # Usamos self.text (la versión plana) para la búsqueda estándar
             match = re.search(regex, self.text, search_flags)
 
             if match:
@@ -147,32 +198,10 @@ class FacturaExtractor:
                 return result, match, pattern
         return "No encontrado", None, None
 
-    # ===============================================
-    # MÉTODO DE EXTRACCIÓN DE DESCRIPCIÓN ESPECÍFICA (CORREGIDO)
-    # ===============================================
-
-    def _extract_specific_description(self):
-        """Método para extraer la descripción según el patrón Adic.*."""
-
-        # Expresión Regular MEJORADA para ser flexible con espacios y puntuación.
-        pattern = r"Adic\.?\*?\s*[-:\s]*\s*([^\d]+?)\s*\d"
-
-        match = re.search(pattern, self.text, re.IGNORECASE)
-
-        if match:
-            # Group 1 es la descripción capturada
-            return match.group(1).strip()
-
-        return None  # Indica que no se encontró con esta regla
-
-    # ===============================================
-    # MÉTODO PRINCIPAL DE EXTRACCIÓN
-    # ===============================================
-
     def extract_all(self):
         """Método principal que ejecuta todas las extracciones."""
 
-        # 1. CLIENTE
+        # 1. CLIENTE (Usando la función externa)
         extracted_name = _find_client_in_text(self.text, EXTRACTION_RULES)
 
         # 2. NÚMERO
@@ -184,17 +213,14 @@ class FacturaExtractor:
             extracted_date = self._parse_date(date_match, date_rule["format"])
         # 4. TOTAL
         extracted_total, _, _ = self._try_find("TOTAL")
+        # 5. DESCRIPCIÓN
+        extracted_description, _, _ = self._try_find("DESCRIPTION")
 
-        # 5. DESCRIPCIÓN (APLICACIÓN DE LA NUEVA LÓGICA)
-        extracted_description = self._extract_specific_description()
-
-        # Si la función específica falló (retornó None)
-        if not extracted_description:
-            # Aplicar reglas de fallback (reglas originales)
-            extracted_description, _, _ = self._try_find("DESCRIPTION")
-
-        if extracted_description == "No encontrado" or not extracted_description:
+        if extracted_description == "No encontrado":
             extracted_description = "Documento Genérico (Default)"
+
+        # 🎯 6. CÓDIGOS DE PRODUCTO (NUEVO)
+        extracted_product_codes = self._extract_product_codes_from_page()
 
         # Retorna el diccionario de resultados
         return {
@@ -204,7 +230,8 @@ class FacturaExtractor:
             "DOLLARS": "",
             "PESOS": extracted_total,
             "EUROS": "",
-            "DESCRIPTION": extracted_description
+            "DESCRIPTION": extracted_description,
+            "PRODUCT_CODES": extracted_product_codes  # 🎯 Nuevo campo
         }
 
 
@@ -244,7 +271,6 @@ def extract_data_from_docx(docx_file):
             formatted_date = quotation_date_raw
 
             # --- LÓGICA DE LIMPIEZA ---
-            # Eliminar el prefijo "CB" si existe, seguido de dígitos.
             quotation_number = re.sub(
                 r"^CB", "", quotation_number, flags=re.IGNORECASE).strip()
 
@@ -292,7 +318,8 @@ def extract_data_from_pdf(pdf_file):
         return {
             "CLIENT": f"ERROR: No se pudo procesar - {e}",
             "DATE": "N/A", "NUMBER": "N/A", "DOLLARS": "N/A",
-            "PESOS": "N/A", "EUROS": "N/A", "DESCRIPTION": "N/A"
+            "PESOS": "N/A", "EUROS": "N/A", "DESCRIPTION": "N/A",
+            "PRODUCT_CODES": "N/A"  # 🎯 Se añade el nuevo campo al retorno de error
         }
 
 
@@ -372,7 +399,6 @@ def main():
                 with st.spinner(f"Iniciando extracción de {len(uploaded_docs)} Cotizaciones (DOCX) y fusionando por orden..."):
 
                     # Iteramos sobre los DOCXs, y usamos el índice para obtener la clave del PDF correspondiente
-                    # Si hay 3 PDFs y 2 DOCXs, solo se fusionan los 2 primeros PDFs.
                     num_docs_to_process = min(
                         len(uploaded_docs), len(pdf_client_keys))
 
@@ -410,10 +436,11 @@ def main():
             consolidated_data = [all_data[key] for key in pdf_client_keys]
 
             # A. Crear el DataFrame final
+            # ⚠️ SE HA MODIFICADO ESTA LISTA DE ACUERDO A TU REQUERIMIENTO (Añadiendo PRODUCT_CODES)
             column_order = [
                 "CLIENT", "QUOTATION_NUMBER", "QUOTATION_DATE",
                 "DATE", "NUMBER", "DOLLARS", "PESOS", "EUROS",
-                "DESCRIPTION", "FILE_NAME"
+                "DESCRIPTION", "PRODUCT_CODES", "FILE_NAME"  # 🎯 Nueva Columna: PRODUCT_CODES
             ]
             df = pd.DataFrame(consolidated_data, columns=column_order)
 
@@ -428,7 +455,7 @@ def main():
 
             def clean_total(x):
                 if isinstance(x, str):
-                    if x in ["No encontrado", "N/A", "Documento Genérico (Default)", "No DOCX adjunto"]:
+                    if x in ["No encontrado", "N/A", "Documento Genérico (Default)", "No DOCX adjunto", "No hay contenido en Pág. 1", "Bloque Adic.* no encontrado", "No se encontraron códigos"]:
                         return x
                     # Remueve el punto como separador de miles
                     cleaned_x = x.replace('.', '')
