@@ -380,10 +380,11 @@ def main():
             consolidated_data = [all_data[key] for key in pdf_client_keys]
 
             # A. Crear el DataFrame final
+            # ⚠️ SE HA MODIFICADO ESTA LISTA DE ACUERDO A TU REQUERIMIENTO
             column_order = [
-                "FILE_NAME", "CLIENT", "DATE", "NUMBER",
-                "QUOTATION_NUMBER", "QUOTATION_DATE",
-                "DOLLARS", "PESOS", "EUROS", "DESCRIPTION"
+                "CLIENT", "QUOTATION_NUMBER", "QUOTATION_DATE",
+                "DATE", "NUMBER", "DOLLARS", "PESOS", "EUROS",
+                "DESCRIPTION", "FILE_NAME"
             ]
             df = pd.DataFrame(consolidated_data, columns=column_order)
 
