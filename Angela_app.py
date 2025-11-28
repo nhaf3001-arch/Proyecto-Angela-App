@@ -6,11 +6,9 @@ from datetime import datetime  # Para formatear la fecha
 import locale  # Para forzar el idioma español en la fecha
 import io
 import xlsxwriter
-# Nueva librería para leer archivos Word (.docx)
 import docx
 
 # ⚠️ CONFIGURACIÓN GLOBAL (Mapeo de meses y Locale)
-# Se mantiene fuera de la clase ya que son constantes de configuración
 MONTH_MAPPING = {
     'enero': 'January', 'febrero': 'February', 'marzo': 'March',
     'abril': 'April', 'mayo': 'May', 'junio': 'June',
@@ -83,11 +81,16 @@ class FacturaExtractor:
 
         try:
             with pdfplumber.open(pdf_file) as pdf:
-                text = "".join(page.extract_text() for page in pdf.pages)
-                text = text.replace('\n', ' ').replace('\r', ' ')
+                # self.raw_text no se usa en este caso pero se mantiene por si es necesario
+                raw_text = "".join(page.extract_text() for page in pdf.pages)
+                self.raw_text = raw_text
+
+                # self.text es la versión plana, crucial para la mayoría de regex
+                text = raw_text.replace('\n', ' ').replace('\r', ' ')
                 self.text = re.sub(r'\s+', ' ', text).strip()
         except Exception as e:
             self.text = ""
+            self.raw_text = ""
             st.warning(f"Error al cargar texto del PDF: {e}")
 
     def _parse_date(self, date_match, date_format_type):
@@ -134,6 +137,7 @@ class FacturaExtractor:
 
             search_flags = re.IGNORECASE if field_name not in [
                 "DESCRIPTION"] else 0
+            # Usamos self.text (la versión plana) para la búsqueda estándar
             match = re.search(regex, self.text, search_flags)
 
             if match:
@@ -143,10 +147,32 @@ class FacturaExtractor:
                 return result, match, pattern
         return "No encontrado", None, None
 
+    # ===============================================
+    # MÉTODO DE EXTRACCIÓN DE DESCRIPCIÓN ESPECÍFICA (CORREGIDO)
+    # ===============================================
+
+    def _extract_specific_description(self):
+        """Método para extraer la descripción según el patrón Adic.*."""
+
+        # Expresión Regular MEJORADA para ser flexible con espacios y puntuación.
+        pattern = r"Adic\.?\*?\s*[-:\s]*\s*([^\d]+?)\s*\d"
+
+        match = re.search(pattern, self.text, re.IGNORECASE)
+
+        if match:
+            # Group 1 es la descripción capturada
+            return match.group(1).strip()
+
+        return None  # Indica que no se encontró con esta regla
+
+    # ===============================================
+    # MÉTODO PRINCIPAL DE EXTRACCIÓN
+    # ===============================================
+
     def extract_all(self):
         """Método principal que ejecuta todas las extracciones."""
 
-        # 1. CLIENTE (Usando la función externa)
+        # 1. CLIENTE
         extracted_name = _find_client_in_text(self.text, EXTRACTION_RULES)
 
         # 2. NÚMERO
@@ -158,10 +184,16 @@ class FacturaExtractor:
             extracted_date = self._parse_date(date_match, date_rule["format"])
         # 4. TOTAL
         extracted_total, _, _ = self._try_find("TOTAL")
-        # 5. DESCRIPCIÓN
-        extracted_description, _, _ = self._try_find("DESCRIPTION")
 
-        if extracted_description == "No encontrado":
+        # 5. DESCRIPCIÓN (APLICACIÓN DE LA NUEVA LÓGICA)
+        extracted_description = self._extract_specific_description()
+
+        # Si la función específica falló (retornó None)
+        if not extracted_description:
+            # Aplicar reglas de fallback (reglas originales)
+            extracted_description, _, _ = self._try_find("DESCRIPTION")
+
+        if extracted_description == "No encontrado" or not extracted_description:
             extracted_description = "Documento Genérico (Default)"
 
         # Retorna el diccionario de resultados
@@ -185,13 +217,11 @@ def extract_data_from_docx(docx_file):
     Extrae el número y fecha de cotización de un archivo DOCX.
     """
     # Patrón: COTIZACIÓN # <CÓDIGO>/<TEXTO>, <FECHA>
-    # Simplificado, ya no necesitamos extraer CLIENT para la fusión forzada.
     QUOTE_PATTERN = r"COTIZACI[ÓO]N\s*#\s*([A-Z0-9]+)\/?[A-Z]*,\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"
 
     extracted_quotation = {
         "QUOTATION_NUMBER": "No encontrado",
         "QUOTATION_DATE": "No encontrado",
-        # El campo CLIENT ya no se extrae ni se necesita para la fusión secuencial.
     }
 
     try:
@@ -213,7 +243,7 @@ def extract_data_from_docx(docx_file):
             quotation_date_raw = match.group(2).strip()
             formatted_date = quotation_date_raw
 
-            # --- NUEVA LÓGICA DE LIMPIEZA ---
+            # --- LÓGICA DE LIMPIEZA ---
             # Eliminar el prefijo "CB" si existe, seguido de dígitos.
             quotation_number = re.sub(
                 r"^CB", "", quotation_number, flags=re.IGNORECASE).strip()
@@ -380,7 +410,6 @@ def main():
             consolidated_data = [all_data[key] for key in pdf_client_keys]
 
             # A. Crear el DataFrame final
-            # ⚠️ SE HA MODIFICADO ESTA LISTA DE ACUERDO A TU REQUERIMIENTO
             column_order = [
                 "CLIENT", "QUOTATION_NUMBER", "QUOTATION_DATE",
                 "DATE", "NUMBER", "DOLLARS", "PESOS", "EUROS",
