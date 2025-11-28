@@ -3,3 +3,5 @@ pandas
 pdfplumber
 openpyxl
 xlsxwriter
+python-docx
+
