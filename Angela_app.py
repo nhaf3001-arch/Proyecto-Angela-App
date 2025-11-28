@@ -436,16 +436,30 @@ def main():
             consolidated_data = [all_data[key] for key in pdf_client_keys]
 
             # A. Crear el DataFrame final
-            # ⚠️ SE HA MODIFICADO ESTA LISTA DE ACUERDO A TU REQUERIMIENTO (Añadiendo PRODUCT_CODES)
-            column_order = [
-                "CLIENT", "QUOTATION_NUMBER", "QUOTATION_DATE",
-                "DATE", "NUMBER", "DOLLARS", "PESOS", "EUROS",
-                "DESCRIPTION", "PRODUCT_CODES", "FILE_NAME"  # 🎯 Nueva Columna: PRODUCT_CODES
-            ]
-            df = pd.DataFrame(consolidated_data, columns=column_order)
+            # Creamos el DataFrame con todas las columnas
+            df = pd.DataFrame(consolidated_data)
+
+            # 🎯 MODIFICACIÓN CLAVE: Mover PRODUCT_CODES a DESCRIPTION
+            # -----------------------------------------------------------
+            # Usamos la columna PRODUCT_CODES para sobrescribir DESCRIPTION
+            df['DESCRIPTION'] = df['PRODUCT_CODES']
+
+            # Eliminamos la columna PRODUCT_CODES ya que su contenido ha sido movido.
+            df = df.drop(columns=['PRODUCT_CODES'])
+            # -----------------------------------------------------------
 
             # Limpiar claves de sufijos si se duplicaron
             df['CLIENT'] = df['CLIENT'].apply(lambda x: x.split('_')[0])
+
+            # Definimos el orden de las columnas FINAL (sin PRODUCT_CODES)
+            column_order = [
+                "CLIENT", "QUOTATION_NUMBER", "QUOTATION_DATE",
+                "DATE", "NUMBER", "DOLLARS", "PESOS", "EUROS",
+                "DESCRIPTION", "FILE_NAME"
+            ]
+
+            # Reindexamos el DataFrame para aplicar el orden final
+            df = df.reindex(columns=column_order)
 
             st.subheader("✅ Datos Consolidados (Vista Previa)")
             st.dataframe(df, width='stretch')
