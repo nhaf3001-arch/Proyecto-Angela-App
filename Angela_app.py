@@ -6,7 +6,8 @@ from datetime import datetime  # Para formatear la fecha
 import locale  # Para forzar el idioma español en la fecha
 import io
 import xlsxwriter
-
+# Nueva librería para leer archivos Word (.docx)
+import docx
 
 # ⚠️ CONFIGURACIÓN GLOBAL (Mapeo de meses y Locale)
 # Se mantiene fuera de la clase ya que son constantes de configuración
@@ -17,6 +18,26 @@ MONTH_MAPPING = {
     'octubre': 'October', 'noviembre': 'November', 'diciembre': 'December'
 }
 
+# Reglas de Extracción Centralizadas (para PDF y DOCX)
+EXTRACTION_RULES = {
+    "CLIENT": [
+        # Regla 1 (MÁXIMA PRECISIÓN para Razón Social):
+        r"(?:SEÑOR\s*\(?ES\)?\s*:\s*)([^\n\r]+?)(?=\s*(?:R\.?U\.?T\.|GIRO|DIRECCI[ÓO]N|FECHA|COMUNA|[\n\r]|$))",
+        # Regla 2 (Fallback si no hay R.U.T. cerca): Busca SR(A): NOMBRE...
+        r"(?:SR\.\(?A\)?[\s:]*)([^\n\r]+?)(?:\s+RUT|[\n\r]|$)",
+        # Regla 3 (Flexible): Fallback por si no tiene prefijo formal
+        r"(?:SR\.\(?A\)?|Hola|Estimado\s*:\s*)?([^\n\r]+?)(?:\s+RUT|[\n\r]|$)"
+    ],
+    "NUMBER": [r"N[°º]\s*:\s*(\d+)", r"N[°º]\s*(\d+)", r"N°\s*:\s*(\d+)"],
+    "DATE": [
+        {"regex": r"Fecha\s+(?:de\s+)?Emisi[óo]n\s*:\s*(\d{1,2})\s+de\s+(\w+)\s+(?:del|de)\s+(\d{4})",
+         "format": "LONG_FORMAT"},
+        {"regex": r"Fecha\s*:\s*(\d{1,2})[\s\-\/](\d{1,2})[\s\-\/](\d{2,4})",
+         "format": "DD_MM_YY"}
+    ],
+    "TOTAL": [r"TOTAL\s+\$\s*([\d\.,]+)", r"Total\s+Cuenta\s+Única\s+Telefónica\s+\$\s*([\d\.,]+)"],
+    "DESCRIPTION": [r"(BOLETA\s+ELECTRONICA)", r"(GUIA\s+DE\s+DESPACHO\s+ELECTRONICA)", r"([A-Z0-9]{2,}[-][A-Z0-9]{2,})", r"\b([A-Z]{3,}\d{2,})\b", r"(SII[^\n\r]+SANTIAGO)"]
+}
 
 # Se intenta configurar el locale.
 try:
@@ -29,78 +50,40 @@ except locale.Error:
 
 
 # ===============================================
-# CLASE DE EXTRACCIÓN (PROGRAMACIÓN ORIENTADA A OBJETOS)
+# FUNCIONES AUXILIARES DE EXTRACCIÓN Y LIMPIEZA
 # ===============================================
 
+def _find_client_in_text(text, rules):
+    """ Busca el nombre del cliente usando las reglas de FacturaExtractor. """
+    patterns = rules.get("CLIENT", [])
+    for pattern in patterns:
+        search_flags = re.IGNORECASE
+        match = re.search(pattern, text, search_flags)
+        if match:
+            result = match.group(1).strip() if len(match.groups()) > 0 else ""
+            # --- LIMPIEZA CRÍTICA ---
+            result = re.sub(
+                r"^(SEÑOR\s*\(?ES\)?\s*:\s*|SR\.\(?A\)?[\s:]*)", "", result, flags=re.IGNORECASE).strip()
+            result = re.sub(r"\s*R\.?U\.?T\..*$", "",
+                            result, flags=re.IGNORECASE).strip()
+            result = result.replace(':', '').strip()
+            return result
+    return "No encontrado"
+
+
+# ===============================================
+# CLASE DE EXTRACCIÓN PDF
+# ===============================================
 
 class FacturaExtractor:
-    """
-    Encapsula la lógica y las reglas de extracción para un tipo de documento.
-    """
-    # REGLAS DE EXTRACCIÓN: Priorizando las reglas del SII (Documentos Chile)
-    EXTRACTION_RULES = {
-        "CLIENT": [
-            # Regla 1 (MÁXIMA PRECISIÓN para Razón Social):
-            # Busca SEÑOR(ES): y captura CUALQUIER COSA de forma perezosa ([^\n\r]+?),
-            # hasta que ve R.U.T., GIRO, DIRECCIÓN o FECHA.
-            r"(?:SEÑOR\s*\(?ES\)?\s*:\s*)([^\n\r]+?)(?=\s*(?:R\.?U\.?T\.|GIRO|DIRECCI[ÓO]N|FECHA|COMUNA|[\n\r]|$))",
-            # Regla 2 (Fallback si no hay R.U.T. cerca): Busca SR(A): NOMBRE...
-            r"(?:SR\.\(?A\)?[\s:]*)([^\n\r]+?)(?:\s+RUT|[\n\r]|$)",
-            # Regla 3 (Flexible): Fallback por si no tiene prefijo formal
-            r"(?:SR\.\(?A\)?|Hola|Estimado\s*:\s*)?([^\n\r]+?)(?:\s+RUT|[\n\r]|$)"
-        ],
-
-        "NUMBER": [
-            # Regla 1 (SII - Prioridad): Busca N° o Nº seguido del número (e.g., Nº27).
-            r"N[°º]\s*:\s*(\d+)",
-            r"N[°º]\s*(\d+)",
-            # Regla 2 (Original): Busca N°: 12345
-            r"N°\s*:\s*(\d+)"
-        ],
-
-        "DATE": [
-            # Regla A (Original/Larga - SII Compatible): Fecha Emision: 09 de Octubre del 2025
-            {"regex": r"Fecha\s+(?:de\s+)?Emisi[óo]n\s*:\s*(\d{1,2})\s+de\s+(\w+)\s+(?:del|de)\s+(\d{4})",
-             "format": "LONG_FORMAT"},
-            # Regla B (Nueva/Corta): 10-02-20 o 10/02/2020
-            {"regex": r"Fecha\s*:\s*(\d{1,2})[\s\-\/](\d{1,2})[\s\-\/](\d{2,4})",
-             "format": "DD_MM_YY"}
-        ],
-
-        "TOTAL": [
-            # Regla 1 (SII - Prioridad): Busca el TOTAL del documento (e.g., TOTAL $ 14.280.000)
-            r"TOTAL\s+\$\s*([\d\.,]+)",
-            # Regla 2 (Original): Busca Total Cuenta Única Telefónica $ 123.456
-            r"Total\s+Cuenta\s+Única\s+Telefónica\s+\$\s*([\d\.,]+)"
-        ],
-
-        "DESCRIPTION": [
-            # --- REGLAS MODIFICADAS: PRIORIZANDO EL TIPO DE DOCUMENTO ---
-            # Regla 1 (MÁXIMA PRIORIDAD - Boleta/Factura Electrónica):
-            # Busca explícitamente la etiqueta "BOLETA ELECTRONICA" o "FACTURA ELECTRONICA"
-            r"(BOLETA\s+ELECTRONICA)",
-            # Regla 2 (Prioridad Media - Guía de Despacho):
-            r"(GUIA\s+DE\s+DESPACHO\s+ELECTRONICA)",
-            # Regla 3 (Fallback - Código de Producto, e.g., SAT-DUST):
-            # Busca códigos alfanuméricos con guion.
-            r"([A-Z0-9]{2,}[-][A-Z0-9]{2,})",
-            # Regla 4 (Fallback - Código/Texto Corto): Busca palabras clave que parezcan SKU (e.g., SATDUST)
-            r"\b([A-Z]{3,}\d{2,})\b",
-            # Regla 5 (Fallback genérico del SII, como el que se estaba capturando antes):
-            r"(SII[^\n\r]+SANTIAGO)",
-            # --- FIN REGLAS MODIFICADAS ---
-        ]
-    }
+    """ Encapsula la lógica y las reglas de extracción para un tipo de documento PDF. """
 
     def __init__(self, pdf_file):
         """Inicializa el extractor leyendo y limpiando el texto del PDF."""
 
         try:
             with pdfplumber.open(pdf_file) as pdf:
-                # Extraer texto de todas las páginas para mayor robustez
                 text = "".join(page.extract_text() for page in pdf.pages)
-                # Limpieza crítica del texto
-                # Se eliminan saltos de línea y se reduce el espacio múltiple a un solo espacio.
                 text = text.replace('\n', ' ').replace('\r', ' ')
                 self.text = re.sub(r'\s+', ' ', text).strip()
         except Exception as e:
@@ -108,25 +91,19 @@ class FacturaExtractor:
             st.warning(f"Error al cargar texto del PDF: {e}")
 
     def _parse_date(self, date_match, date_format_type):
-        """
-        Método privado para parsear la fecha basándose en el tipo de formato.
-        Utiliza el mapeo global MONTH_MAPPING.
-        """
+        """ Método privado para parsear la fecha basándose en el tipo de formato. """
         extracted_date = "Error de Formato (Parseo)"
         if date_format_type == "LONG_FORMAT":
             try:
                 day = date_match.group(1)
                 month_es = date_match.group(2)
                 year = date_match.group(3)
-                # Intento con locale y fallback con mapeo
                 try:
                     date_str = f"{day} de {month_es} de {year}"
                     date_obj = datetime.strptime(date_str, '%d de %B de %Y')
                 except ValueError:
-                    # Fallback usando el mapeo de meses a inglés
                     month_es_lower = month_es.lower()
                     month_en = MONTH_MAPPING.get(month_es_lower, month_es)
-                    # Usamos 'of' y luego intentamos parsear con la versión en inglés del mes
                     date_str = f"{day} of {month_en} of {year}"
                     date_obj = datetime.strptime(date_str, '%d of %B of %Y')
                 extracted_date = date_obj.strftime('%d-%m-%y')
@@ -137,7 +114,6 @@ class FacturaExtractor:
                 day = date_match.group(1).zfill(2)
                 month = date_match.group(2).zfill(2)
                 year = date_match.group(3)
-                # Asegurar año de 4 dígitos si viene de 2
                 if len(year) == 2:
                     year = f"20{year}"
                 date_str = f"{day}-{month}-{year}"
@@ -148,48 +124,31 @@ class FacturaExtractor:
         return extracted_date
 
     def _try_find(self, field_name):
-        """
-        Método privado que prueba secuencialmente los patrones para un campo.
-        """
-        patterns = self.EXTRACTION_RULES.get(field_name, [])
+        """ Método privado que prueba secuencialmente los patrones para un campo. """
+        patterns = EXTRACTION_RULES.get(field_name, [])
         for pattern in patterns:
             if isinstance(pattern, dict):
-                # Para reglas complejas como la Fecha
                 regex = pattern.get("regex")
             else:
-                # Para reglas sencillas (Cliente, Número, Total, Descripción)
                 regex = pattern
-            # Buscamos en el texto limpio del PDF
-            search_flags = 0
-            # Se usa re.IGNORECASE para todos, excepto para DESCRIPTION (donde BOLETA/GUIA deben ser precisos)
-            if field_name not in ["DESCRIPTION"]:
-                search_flags = re.IGNORECASE
+
+            search_flags = re.IGNORECASE if field_name not in [
+                "DESCRIPTION"] else 0
             match = re.search(regex, self.text, search_flags)
+
             if match:
-                # Si el patrón es simple, devolvemos el grupo 1, el objeto match y el patrón.
                 result = match.group(1).strip() if len(
                     match.groups()) > 0 else ""
-                # --- LIMPIEZA CRÍTICA PARA CLIENTE ---
-                if field_name == "CLIENT":
-                    # 1. Eliminar explícitamente cualquier prefijo de cortesía/etiqueta
-                    # Esto garantiza que el nombre quede solo.
-                    result = re.sub(
-                        r"^(SEÑOR\s*\(?ES\)?\s*:\s*|SR\.\(?A\)?[\s:]*)", "", result, flags=re.IGNORECASE).strip()
-                    # 2. Eliminar cualquier R.U.T. o texto que se haya colado al final,
-                    # usando una detención en R.U.T. si la regex falló.
-                    result = re.sub(r"\s*R\.?U\.?T\..*$", "",
-                                    result, flags=re.IGNORECASE).strip()
-                    # 3. Limpieza de cualquier carácter residual (como dos puntos o espacios al final)
-                    result = result.replace(':', '').strip()
+                # La limpieza crítica de CLIENTE ahora se hace en _find_client_in_text.
                 return result, match, pattern
-        # Si no se encuentra ninguna coincidencia
         return "No encontrado", None, None
 
     def extract_all(self):
         """Método principal que ejecuta todas las extracciones."""
 
-        # 1. CLIENTE (Limpieza adicional en _try_find)
-        extracted_name, _, _ = self._try_find("CLIENT")
+        # 1. CLIENTE (Usando la función externa)
+        extracted_name = _find_client_in_text(self.text, EXTRACTION_RULES)
+
         # 2. NÚMERO
         extracted_number, _, _ = self._try_find("NUMBER")
         # 3. FECHA
@@ -200,13 +159,10 @@ class FacturaExtractor:
         # 4. TOTAL
         extracted_total, _, _ = self._try_find("TOTAL")
         # 5. DESCRIPCIÓN
-        # Se extrae el primer patrón encontrado (que ahora prioriza el tipo de documento)
         extracted_description, _, _ = self._try_find("DESCRIPTION")
 
-        # Fallback si no encuentra ninguna de las etiquetas
         if extracted_description == "No encontrado":
             extracted_description = "Documento Genérico (Default)"
-            pass
 
         # Retorna el diccionario de resultados
         return {
@@ -221,29 +177,75 @@ class FacturaExtractor:
 
 
 # ===============================================
-# FUNCIÓN DE ENTRADA (Wrapper)
+# FUNCIÓN DE EXTRACCIÓN DOCX
 # ===============================================
 
+def extract_data_from_docx(docx_file):
+    """
+    Extrae el número y fecha de cotización de un archivo DOCX.
+    """
+    # Patrón: COTIZACIÓN # <CÓDIGO>/<TEXTO>, <FECHA>
+    # Simplificado, ya no necesitamos extraer CLIENT para la fusión forzada.
+    QUOTE_PATTERN = r"COTIZACI[ÓO]N\s*#\s*([A-Z0-9]+)\/?[A-Z]*,\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})"
 
-def extract_data_from_pdf(pdf_file):
-    """
-    Función de entrada que crea una instancia del extractor
-    y llama a su método principal para obtener los datos.
-    """
+    extracted_quotation = {
+        "QUOTATION_NUMBER": "No encontrado",
+        "QUOTATION_DATE": "No encontrado",
+        # El campo CLIENT ya no se extrae ni se necesita para la fusión secuencial.
+    }
+
     try:
-        extractor = FacturaExtractor(pdf_file)
-        return extractor.extract_all()
+        # Load the document from the in-memory BytesIO object
+        document = docx.Document(docx_file)
+
+        # Leemos todo el texto del documento
+        full_text = []
+        for paragraph in document.paragraphs:
+            full_text.append(paragraph.text)
+        # Unir y limpiar el texto
+        text = " ".join(full_text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # 1. Extracción del Número y Fecha de Cotización
+        match = re.search(QUOTE_PATTERN, text, re.IGNORECASE)
+        if match:
+            quotation_number = match.group(1).strip()
+            quotation_date_raw = match.group(2).strip()
+            formatted_date = quotation_date_raw
+
+            # --- NUEVA LÓGICA DE LIMPIEZA ---
+            # Eliminar el prefijo "CB" si existe, seguido de dígitos.
+            quotation_number = re.sub(
+                r"^CB", "", quotation_number, flags=re.IGNORECASE).strip()
+
+            try:  # Intentar formatear la fecha
+                date_obj = datetime.strptime(quotation_date_raw, '%d/%m/%Y')
+                formatted_date = date_obj.strftime('%d-%m-%y')
+            except ValueError:
+                try:
+                    date_obj = datetime.strptime(
+                        quotation_date_raw, '%d-%m-%Y')
+                    formatted_date = date_obj.strftime('%d-%m-%y')
+                except ValueError:
+                    try:
+                        date_obj = datetime.strptime(
+                            quotation_date_raw, '%d/%m/%y')
+                        formatted_date = date_obj.strftime('%d-%m-%y')
+                    except ValueError:
+                        pass  # Si falla, se deja la cadena original.
+
+            extracted_quotation["QUOTATION_NUMBER"] = quotation_number
+            extracted_quotation["QUOTATION_DATE"] = formatted_date
+
+        return extracted_quotation
+
+    except ImportError:
+        st.error("Error: La librería 'python-docx' (import docx) no está instalada. Es necesaria para procesar archivos Word.")
+        return extracted_quotation
     except Exception as e:
-        # Retorna una fila de error si el archivo no puede ser procesado
-        return {
-            "CLIENT": f"ERROR: No se pudo procesar - {e}",
-            "DATE": "N/A",
-            "NUMBER": "N/A",
-            "DOLLARS": "N/A",
-            "PESOS": "N/A",
-            "EUROS": "N/A",
-            "DESCRIPTION": "N/A"
-        }
+        st.warning(
+            f"Error al procesar el archivo DOCX: {docx_file.name}. Detalles: {e}")
+        return extracted_quotation
 
 
 # ===============================================
@@ -251,84 +253,182 @@ def extract_data_from_pdf(pdf_file):
 # ===============================================
 
 
+def extract_data_from_pdf(pdf_file):
+    """ Función wrapper para la extracción de PDF. """
+    try:
+        extractor = FacturaExtractor(pdf_file)
+        return extractor.extract_all()
+    except Exception as e:
+        return {
+            "CLIENT": f"ERROR: No se pudo procesar - {e}",
+            "DATE": "N/A", "NUMBER": "N/A", "DOLLARS": "N/A",
+            "PESOS": "N/A", "EUROS": "N/A", "DESCRIPTION": "N/A"
+        }
+
+
 def main():
-    st.set_page_config(page_title="PDF a Excel Múltiple", layout="wide")
-    st.title("📂 Extracción Consolidada de Múltiples PDFs a Excel")
-    st.subheader("Paso 1: Cargar Archivos PDF")
+    st.set_page_config(page_title="PDF y DOCX a Excel Múltiple", layout="wide")
+    st.title("📂 Extracción Consolidada de Facturas y Cotizaciones a Excel")
+
+    # === UPLOADERS ===
+    st.subheader("Paso 1: Cargar Facturas (PDF)")
     uploaded_pdfs = st.file_uploader(
         "Sube uno o más archivos PDF (Facturas):",
         type=["pdf"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="pdf_uploader"
     )
-    if uploaded_pdfs:
-        st.success(f"Se cargaron **{len(uploaded_pdfs)}** archivos.")
-        if st.button("Procesar y Consolidar en Excel"):
-            consolidated_data = []
-            with st.spinner(f"Iniciando extracción y consolidación de {len(uploaded_pdfs)} archivos..."):
-                # Itera sobre CADA archivo cargado
-                for uploaded_pdf in uploaded_pdfs:
-                    try:
-                        pdf_data = io.BytesIO(uploaded_pdf.getvalue())
-                        # Llama a la función wrapper, que ahora usa la clase OOP
-                        result = extract_data_from_pdf(pdf_data)
-                        # Agrega el nombre del archivo
-                        result['FILE_NAME'] = uploaded_pdf.name
-                        consolidated_data.append(result)
-                    except Exception as e:
-                        st.warning(
-                            f"No se pudo procesar {uploaded_pdf.name}. Error: {e}")
-                        consolidated_data.append({
-                            "CLIENT": f"ERROR FATAL: {uploaded_pdf.name}",
-                            "DATE": "N/A",
-                            "NUMBER": "N/A",
-                            "DOLLARS": "N/A",
-                            "PESOS": "N/A",
-                            "EUROS": "N/A",
-                            "DESCRIPTION": "N/A",
-                            "FILE_NAME": uploaded_pdf.name
-                        })
-                # A. Crear el DataFrame final
-                column_order = ["FILE_NAME", "CLIENT", "DATE",
-                                "NUMBER", "DOLLARS", "PESOS", "EUROS", "DESCRIPTION"]
-                df = pd.DataFrame(consolidated_data, columns=column_order)
-                st.subheader("✅ Datos Consolidados (Vista Previa)")
-                st.dataframe(df, width='stretch')
-                # B. Crear el archivo Excel en memoria
-                output = io.BytesIO()
 
-                def clean_total(x):
-                    if isinstance(x, str):
-                        # Maneja el caso de "No encontrado"
-                        if x in ["No encontrado", "N/A", "Documento Genérico (Default)"]:
-                            return x
-                        # Elimina separadores de miles (puntos)
-                        cleaned_x = x.replace('.', '')
-                        # Convierte la coma a punto decimal (aunque se espera que solo haya puntos para miles)
-                        cleaned_x = cleaned_x.replace(',', '.')
+    st.subheader("Paso 2: Cargar Cotizaciones (DOCX)")
+    uploaded_docs = st.file_uploader(
+        "Sube uno o más archivos Word (.docx) (Se fusionarán por orden de carga con los PDFs):",
+        type=["docx"],
+        accept_multiple_files=True,
+        key="docx_uploader"
+    )
+
+    # === PROCESAMIENTO ===
+    if uploaded_pdfs or uploaded_docs:
+        if st.button("Procesar y Consolidar en Excel", type="primary"):
+
+            # Almacenamiento consolidado. La clave es el CLIENTE
+            all_data = {}
+
+            # NUEVO: Lista para mantener el orden de las claves de los clientes
+            # (El orden de los PDFs define el orden de las filas)
+            pdf_client_keys = []
+
+            # --- 1. PROCESAR PDFs (Fuente principal de filas) ---
+            if uploaded_pdfs:
+                with st.spinner(f"Iniciando extracción de {len(uploaded_pdfs)} Facturas (PDF)..."):
+                    for uploaded_pdf in uploaded_pdfs:
                         try:
-                            # Intentar convertir a float
-                            return float(cleaned_x)
-                        except ValueError:
-                            # Si falla la conversión, devolver el valor original como string
-                            return x
-                    return x
-                # Limpiamos solo la columna PESOS para convertirla a número
-                df['PESOS'] = df['PESOS'].apply(clean_total)
-                # Uso de xlsxwriter
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, index=False,
-                                sheet_name='Datos Facturas')
-                output.seek(0)
-                # C. Botón de descarga
-                st.subheader("⬇️ Archivo Excel Consolidado Generado")
-                st.download_button(
-                    label="Descargar Excel de Facturas",
-                    data=output.read(),
-                    file_name=f"Facturas_Consolidadas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_button"
-                )
-                st.balloons()
+                            pdf_data = io.BytesIO(uploaded_pdf.getvalue())
+                            result = extract_data_from_pdf(pdf_data)
+
+                            # ⚠️ CLAVE DE FUSIÓN: Nombre del Cliente (normalizado)
+                            merge_key = result["CLIENT"].upper().strip()
+
+                            # Solo agregamos si se encontró el cliente en el PDF
+                            if merge_key != "NO ENCONTRADO" and merge_key != "":
+
+                                # Si ya existe el cliente (duplicado), le agregamos un sufijo para que sea único
+                                unique_merge_key = merge_key
+                                count = 1
+                                while unique_merge_key in all_data:
+                                    unique_merge_key = f"{merge_key}_{count}"
+                                    count += 1
+
+                                # Guardar la clave única para usarla en la fusión DOCX
+                                pdf_client_keys.append(unique_merge_key)
+
+                                # Añadimos placeholders para las columnas de cotización
+                                placeholder_quote_data = {
+                                    "QUOTATION_NUMBER": "No DOCX adjunto",
+                                    "QUOTATION_DATE": "No DOCX adjunto"
+                                }
+                                all_data[unique_merge_key] = {
+                                    **result, **placeholder_quote_data, "FILE_NAME": uploaded_pdf.name}
+                            else:
+                                st.warning(
+                                    f"PDF ignorado: {uploaded_pdf.name}. No se pudo extraer el CLIENTE para generar la fila.")
+
+                        except Exception as e:
+                            st.warning(
+                                f"Error en PDF {uploaded_pdf.name}: {e}")
+
+            # --- 2. PROCESAR DOCX (Fusión SECUENCIAL forzada) ---
+            if uploaded_docs:
+                with st.spinner(f"Iniciando extracción de {len(uploaded_docs)} Cotizaciones (DOCX) y fusionando por orden..."):
+
+                    # Iteramos sobre los DOCXs, y usamos el índice para obtener la clave del PDF correspondiente
+                    # Si hay 3 PDFs y 2 DOCXs, solo se fusionan los 2 primeros PDFs.
+                    num_docs_to_process = min(
+                        len(uploaded_docs), len(pdf_client_keys))
+
+                    for i in range(num_docs_to_process):
+                        uploaded_doc = uploaded_docs[i]
+                        # Obtenemos la clave del PDF correspondiente
+                        pdf_key_to_update = pdf_client_keys[i]
+
+                        try:
+                            doc_data = io.BytesIO(uploaded_doc.getvalue())
+                            quote_result = extract_data_from_docx(doc_data)
+
+                            # ¡FUSIÓN EXITOSA FORZADA! Actualizamos la fila del PDF usando la clave secuencial
+                            all_data[pdf_key_to_update].update(quote_result)
+
+                            original_client_name = all_data[pdf_key_to_update]['CLIENT']
+                            st.success(
+                                f"DOCX fusionado (Secuencial): {uploaded_doc.name} se consolidó con la fila del PDF '{original_client_name}'.")
+
+                        except KeyError:
+                            # Esto no debería pasar si pdf_key_to_update está en pdf_client_keys
+                            st.error(
+                                f"Error interno: La clave '{pdf_key_to_update}' no existe en all_data.")
+                        except Exception as e:
+                            st.warning(
+                                f"Error en DOCX {uploaded_doc.name} (Fallo Secuencial): {e}")
+
+                    if len(uploaded_docs) > len(pdf_client_keys):
+                        st.info(
+                            f"Se ignoraron {len(uploaded_docs) - len(pdf_client_keys)} DOCXs porque no había más PDFs para fusionar.")
+
+            # --- 3. CONSOLIDAR DATAFRAME ---
+
+            # Mapear el diccionario de resultados a una lista, manteniendo el orden de las claves.
+            consolidated_data = [all_data[key] for key in pdf_client_keys]
+
+            # A. Crear el DataFrame final
+            column_order = [
+                "FILE_NAME", "CLIENT", "DATE", "NUMBER",
+                "QUOTATION_NUMBER", "QUOTATION_DATE",
+                "DOLLARS", "PESOS", "EUROS", "DESCRIPTION"
+            ]
+            df = pd.DataFrame(consolidated_data, columns=column_order)
+
+            # Limpiar claves de sufijos si se duplicaron
+            df['CLIENT'] = df['CLIENT'].apply(lambda x: x.split('_')[0])
+
+            st.subheader("✅ Datos Consolidados (Vista Previa)")
+            st.dataframe(df, width='stretch')
+
+            # B. Crear el archivo Excel en memoria
+            output = io.BytesIO()
+
+            def clean_total(x):
+                if isinstance(x, str):
+                    if x in ["No encontrado", "N/A", "Documento Genérico (Default)", "No DOCX adjunto"]:
+                        return x
+                    # Remueve el punto como separador de miles
+                    cleaned_x = x.replace('.', '')
+                    # Reemplaza la coma por punto para decimales (formato float)
+                    cleaned_x = cleaned_x.replace(',', '.')
+                    try:
+                        return float(cleaned_x)
+                    except ValueError:
+                        return x
+                # Para números directos, los devuelve tal cual
+                return x
+
+            # Aplicar limpieza a la columna PESOS
+            df['PESOS'] = df['PESOS'].apply(clean_total)
+
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False,
+                            sheet_name='Datos Consolidación')
+            output.seek(0)
+
+            # C. Botón de descarga
+            st.subheader("⬇️ Archivo Excel Consolidado Generado")
+            st.download_button(
+                label="Descargar Excel Consolidado",
+                data=output.read(),
+                file_name=f"Consolidado_Facturas_Cotizaciones_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_button"
+            )
+            st.balloons()
 
 
 if __name__ == "__main__":
